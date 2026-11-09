@@ -3,6 +3,12 @@
 A live map of about 12,000 public environmental sensors and every bus, tram and train in Germany.
 It runs on your own computer or a small home server. It needs only Python: no extra packages, no API keys.
 
+![All trains in Germany, colored by punctuality, over fine-dust sensors](docs/germany-trains.png)
+
+| Berlin: buses, trams, S- and U-Bahn | Osnabrück: city buses with delays |
+|---|---|
+| ![Berlin](docs/berlin-buses.png) | ![Osnabrück](docs/osnabrueck-buses.png) |
+
 ## Installation
 
 You need **Python 3.9 or newer**, with SQLite 3.24 or newer, which every Python from the last years has.
