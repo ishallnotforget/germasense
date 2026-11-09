@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Osnabrück Sensors</title>
+<title>GermaSense</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <style>
@@ -115,14 +115,15 @@ a { color: var(--series-1); }
 <body>
 <header>
   <div>
-    <h1>Osnabrück Sensors</h1>
+    <h1>GermaSense</h1>
     <div class="sub" id="updated">loading…</div>
   </div>
   <label>Show <select id="quantity" aria-label="Measured quantity"></select></label>
   <label title="Estimated from live stop times (gtfs.de). Positions are interpolated between stops."><input type="checkbox" id="busToggle"> Buses &amp; trains <span class="sub" id="busCount"></span></label>
   <input id="lineFilter" list="lineList" placeholder="Lines, e.g. M3, RE18" aria-label="Show only these lines" autocomplete="off">
   <datalist id="lineList"></datalist>
-  <div id="pollen" title="DWD pollen forecast for today, western Lower Saxony (0–3)"></div>
+  <label title="DWD pollen forecast for today (0–3)">Pollen <select id="pollenRegion" aria-label="Pollen region"></select></label>
+  <div id="pollen"></div>
   <div class="spacer"></div>
   <button id="theme" title="Toggle light/dark">◐</button>
 </header>
@@ -145,14 +146,18 @@ const LABELS = {
   wind_gust_speed_10: "Böen", cloud_cover: "Bewölkung", visibility: "Sichtweite",
   wind_speed: "Windgeschwindigkeit (senseBox)", wind_direction: "Windrichtung (senseBox)", noise: "Lautstärke",
   o3: "Ozon", no2: "Stickstoffdioxid", uv_index_daily_max: "UV-Index (Tagesmax.)",
+  co: "Kohlenmonoxid", so2: "Schwefeldioxid", ground_temperature: "Temperatur 5 cm über Boden",
+  snow_depth: "Schneehöhe", solar_radiation: "Globalstrahlung", sunshine_10: "Sonnenschein 10 min",
+  noise_laeq: "Lärm (LAeq)", discharge: "Abfluss", conductivity: "Leitfähigkeit", oxygen: "Sauerstoff",
+  ph: "pH-Wert", parking_free: "Parkhaus: freie Plätze", parking_occupancy: "Parkhaus: Belegung",
 };
 const SOURCES = { sensor_community: "Sensor.Community", opensensemap: "openSenseMap", dwd: "DWD",
   pegelonline: "Pegelonline (WSV)", bfs_odl: "BfS Radioaktivität", bfs_uv: "BfS UV", uba: "Umweltbundesamt",
-  dwd_pollen: "DWD Pollen" };
+  dwd_pollen: "DWD Pollen", parking: "ParkenDD" };
 const label = q => LABELS[q] || q.replace(/^osm_/, "").replace(/_/g, " ");
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const fmt = v => Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2).replace(/0$/, "");
-const ago = ts => { const m = Math.round((Date.now() - Date.parse(ts)) / 60000);
+const ago = ts => { const m = Math.round(Date.now() / 60000 - ts / 60);  // ts: unix seconds
   return m < 60 ? `${m} min` : m < 1440 ? `${Math.round(m / 60)} h` : `${Math.round(m / 1440)} d`; };
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const api = (p, q = {}) => fetch(`/api/${p}?` + new URLSearchParams(q)).then(r => r.json());
@@ -165,8 +170,8 @@ if (savedTheme) document.documentElement.dataset.theme = savedTheme;
 const isDark = () => document.documentElement.dataset.theme
   ? document.documentElement.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
 
-// Canvas renderer: ~800 sensor dots stay smooth while panning
-const map = L.map("map", { zoomControl: true, preferCanvas: true }).setView([52.09, 7.70], 9);
+// Canvas renderer: ~5000 sensor dots stay smooth while panning
+const map = L.map("map", { zoomControl: true, preferCanvas: true }).setView([51.2, 10.4], 6);
 let tiles;
 function setTiles() {
   if (tiles) map.removeLayer(tiles);
@@ -187,7 +192,8 @@ legend.onAdd = () => Object.assign(L.DomUtil.create("div", "legend"), { id: "leg
 legend.addTo(map);
 
 const layer = L.layerGroup().addTo(map);
-let quantity = store.get("quantity") || "pm10", points = [], quantityList = [], selected = null, hours = 48;
+let quantity = store.get("quantity") || "pm10", points = [], quantityList = [], selected = null, hours = 48, unit = "", sc = null;
+const dotRadius = () => { const z = map.getZoom(); return z < 7 ? 2.5 : z < 9 ? 4 : z < 11 ? 6 : 7; };
 
 // Sequential scale over the 5th–95th percentile so a single broken sensor doesn't flatten the map
 function scale(values) {
@@ -202,36 +208,45 @@ function scale(values) {
 
 function render() {
   layer.clearLayers();
-  const unit = points[0]?.unit || "";
   const leg = document.getElementById("legend");
-  if (!points.length) { leg.innerHTML = `<b>${esc(label(quantity))}</b><div class="sub">no current data</div>`; renderTable(null); return; }
-  const sc = scale(points.map(p => p.value));
+  if (!points.length) { sc = null; leg.innerHTML = `<b>${esc(label(quantity))}</b><div class="sub">no current data</div>`; renderTable(); return; }
+  sc = scale(points.map(p => p.value));
+  const r = dotRadius(), w = r < 4 ? 0.5 : r < 6 ? 1 : 2;
   leg.innerHTML = `<b>${esc(label(quantity))}</b> <span class="sub">${esc(unit)} · ${points.length} stations</span>
     <div class="bar" style="background:linear-gradient(90deg,${sc.ramp.join(",")})"></div>
     <div class="ends"><span>≤ ${fmt(sc.lo)}</span><span>≥ ${fmt(sc.hi)}</span></div>`;
   for (const p of points) {
     const m = L.circleMarker([p.lat, p.lon], {
-      radius: 7, weight: 2, color: css("--surface-1"), fillColor: sc.color(p.value), fillOpacity: 1,
+      radius: r, weight: w, color: css("--surface-1"), fillColor: sc.color(p.value), fillOpacity: 1,
     }).addTo(layer);
-    m.bindTooltip(`${esc(p.name)}<br><b>${fmt(p.value)} ${esc(p.unit || "")}</b> <span class="src">${ago(p.ts)} ago</span>
+    // Tooltip text is built on hover only: binding 5000 strings up front costs more than drawing the dots
+    m.bindTooltip(() => `${esc(p.name)}<br><b>${fmt(p.value)} ${esc(unit || "")}</b> <span class="src">${ago(p.ts)} ago</span>
       <div class="src">${esc(SOURCES[p.source] || p.source)}</div>`, { className: "tip", direction: "top", offset: [0, -6] });
     m.on("click", () => showStation(p.id, quantity));
   }
-  if (!selected) renderTable(sc);
+  if (!selected) renderTable();
 }
+let lastRadius = null;
+map.on("zoomend", () => { if (dotRadius() !== lastRadius) { lastRadius = dotRadius(); render(); } });
+map.on("moveend", () => { if (!selected) renderTable(); });
 
-function renderTable(sc) {
+const TABLE_ROWS = 200;
+function renderTable() {
   const panel = document.getElementById("panel");
   if (!sc) { panel.innerHTML = `<h2>${esc(label(quantity))}</h2><p class="sub">No readings in the last 6 hours.</p>`; return; }
-  const rows = [...points].sort((a, b) => b.value - a.value);
+  const bounds = map.getBounds();
+  const inView = points.filter(p => bounds.contains([p.lat, p.lon])).sort((a, b) => b.value - a.value);
+  const rows = inView.slice(0, TABLE_ROWS);
+  const vals = inView.map(p => p.value), mean = vals.reduce((a, b) => a + b, 0) / (vals.length || 1);
   panel.innerHTML = `<h2>${esc(label(quantity))}</h2>
-    <div class="sub">All ${rows.length} stations, highest first. Click a row or a dot for details.</div>
-    <table><thead><tr><th>Station</th><th class="num">${esc(rows[0].unit || "")}</th><th class="num">Age</th></tr></thead><tbody>
+    <div class="sub">${inView.length} of ${points.length} stations in view${inView.length ? `, mean ${fmt(mean)} ${esc(unit)}` : ""}.
+      ${inView.length > TABLE_ROWS ? `Showing the highest ${TABLE_ROWS}; zoom in for more.` : "Highest first."} Click a row or a dot for details.</div>
+    <table><thead><tr><th>Station</th><th class="num">${esc(unit)}</th><th class="num">Age</th></tr></thead><tbody>
     ${rows.map(p => `<tr class="click" data-id="${esc(p.id)}"><td><span class="swatch" style="background:${sc.color(p.value)}"></span>${esc(p.name)}
       <div class="sub">${esc(SOURCES[p.source] || p.source)}</div></td><td class="num">${fmt(p.value)}</td>
       <td class="num old">${ago(p.ts)}</td></tr>`).join("")}</tbody></table>`;
   panel.querySelectorAll("tr.click").forEach(tr => tr.onclick = () => {
-    const p = points.find(x => x.id === tr.dataset.id); map.panTo([p.lat, p.lon]); showStation(p.id, quantity);
+    const p = points.find(x => x.id === +tr.dataset.id); map.panTo([p.lat, p.lon]); showStation(p.id, quantity);
   });
 }
 
@@ -265,7 +280,7 @@ function drawChart(data, unit) {
   const el = document.getElementById("chart");
   if (data.length < 2) { el.innerHTML = `<div class="sub">Not enough history yet (${data.length} reading${data.length === 1 ? "" : "s"}). The collector adds a point every 10 minutes.</div>`; return; }
   const W = el.clientWidth || 340, H = 180, m = { l: 40, r: 8, t: 8, b: 22 };
-  const xs = data.map(d => Date.parse(d[0])), ys = data.map(d => d[1]);
+  const xs = data.map(d => d[0] * 1000), ys = data.map(d => d[1]);
   let y0 = Math.min(...ys), y1 = Math.max(...ys); if (y0 === y1) { y0 -= 1; y1 += 1; }
   const pad = (y1 - y0) * 0.08; y0 -= pad; y1 += pad;
   const x0 = xs[0], x1 = xs[xs.length - 1];
@@ -313,19 +328,33 @@ async function loadQuantities() {
 async function refresh() {
   try {
     const [pts, st] = await Promise.all([api("latest", { quantity }), api("status")]);
-    points = pts;
+    unit = pts.unit || "";
+    points = pts.rows.map(([id, lat, lon, value, ts, name, source]) => ({ id, lat, lon, value, ts, name, source }));
     const errs = st.sources.filter(s => s.error).map(s => SOURCES[s.source] || s.source);
     document.getElementById("updated").innerHTML = st.last_run
-      ? `Last collection ${new Date(st.last_run).toLocaleTimeString("de-DE", { timeStyle: "short" })} · ${st.sources.reduce((a, s) => a + s.stations, 0)} stations`
+      ? `Last collection ${new Date(st.last_run * 1000).toLocaleTimeString("de-DE", { timeStyle: "short" })} · ${st.sources.reduce((a, s) => a + s.stations, 0)} stations`
         + (errs.length ? ` · <span class="err">failed: ${esc(errs.join(", "))}</span>` : "")
       : "no data yet";
-    document.getElementById("pollen").innerHTML = st.pollen.filter(p => p.value > 0).map(p =>
-      `<span class="chip">${esc(p.quantity.replace("pollen_", ""))} ${p.value}</span>`).join("")
-      || (st.pollen.length ? `<span class="chip">Pollen: none today</span>` : "");
+    pollen = st.pollen; renderPollen();
     render();
   } catch (e) {
     document.getElementById("updated").innerHTML = `<span class="err">Server not reachable</span>`;
   }
+}
+
+// Pollen: one DWD forecast region at a time, chosen in the header
+let pollen = {};
+const pollenSel = document.getElementById("pollenRegion");
+pollenSel.onchange = () => { store.set("pollen", pollenSel.value); renderPollen(); };
+function renderPollen() {
+  const keys = Object.keys(pollen).sort((a, b) => pollen[a].region.localeCompare(pollen[b].region, "de"));
+  const want = pollenSel.value || store.get("pollen") || "pollen:31";
+  if (pollenSel.options.length !== keys.length)
+    pollenSel.innerHTML = keys.map(k => `<option value="${esc(k)}">${esc(pollen[k].region)}</option>`).join("");
+  pollenSel.value = keys.includes(want) ? want : keys[0] || "";
+  const vals = Object.entries(pollen[pollenSel.value]?.values || {}).filter(([, v]) => v > 0);
+  document.getElementById("pollen").innerHTML = vals.map(([q, v]) =>
+    `<span class="chip">${esc(q.replace("pollen_", ""))} ${v}</span>`).join("") || (keys.length ? `<span class="chip">none today</span>` : "");
 }
 
 // --- Buses & trains: server sends each vehicle's current segment, we animate along it every second ---
@@ -340,13 +369,13 @@ busLegend.onAdd = () => {
     <div><span class="veh critical">M1 <span class="d">+12</span></span> 10+ min late</div>
     <div><span class="veh nolive">M3</span> timetable only, no live data</div>
     <div><span class="veh train good">RE18</span> train</div>
-    <div class="sub">Zoomed out: coloured dots. Zoom in for line numbers.</div>`;
+    <div class="sub">Below zoom 9 trains only; dots until zoom 12, then line numbers.</div>`;
   return d;
 };
 let vehicles = [], clockOffset = 0, busTimer = null, busPoll = null, renderedAsDots = null;
 const markers = new Map();
 const STATUS = { good: "#0ca30c", warning: "#fab219", serious: "#ec835a", critical: "#d03b3b" };
-// Zoomed out over the Ruhr there are thousands of vehicles: draw coloured dots, line labels from zoom 12
+// Thousands of vehicles in view: draw coloured dots, line labels from zoom 12 (and only trains below zoom 9)
 const dotMode = () => map.getZoom() < 12;
 let moveTimer;
 map.on("moveend", () => { if (busToggle.checked) { clearTimeout(moveTimer); moveTimer = setTimeout(loadBuses, 300); } });
@@ -406,7 +435,8 @@ function animateBuses() {
 async function loadBuses() {
   try {
     const b = map.getBounds().pad(0.3);
-    const res = await api("buses", { bbox: [b.getSouth(), b.getWest(), b.getNorth(), b.getEast()].map(x => x.toFixed(4)).join(",") });
+    const res = await api("buses", { bbox: [b.getSouth(), b.getWest(), b.getNorth(), b.getEast()].map(x => x.toFixed(4)).join(","),
+                                      rail: map.getZoom() < 9 ? 1 : 0 });
     clockOffset = res.now - Date.now() / 1000;
     vehicles = res.vehicles;
     const dots = dotMode();
@@ -427,6 +457,7 @@ async function loadBuses() {
     const lines = [...new Set(vehicles.map(v => v.line))].sort((a, b) => a.localeCompare(b, "de", { numeric: true }));
     document.getElementById("lineList").innerHTML = lines.map(l => `<option value="${esc(l)}">`).join("");
     applyFilter();
+    if (res.rail_only && !res.loading) document.getElementById("busCount").textContent += " · trains only, zoom in for buses";
     if (res.loading) document.getElementById("busCount").textContent = "(loading timetable…)";
     else if (res.error) document.getElementById("busCount").textContent += " feed error";
   } catch (e) {

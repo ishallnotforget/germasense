@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Estimated live bus and train positions around Osnabrück.
+"""Estimated live bus and train positions for all of Germany.
 
-Nobody publishes GPS positions here. Instead we combine:
+Nobody publishes GPS positions. Instead we combine:
   * the national timetable (gtfs.de, weekly) -> every trip that should be on the road right now, and
   * the free Germany-wide GTFS-Realtime feed (gtfs.de, ~minutely) -> live times/delays for the trips that report them.
 A vehicle between two stops is placed proportionally along the straight line between them.
 Trips without realtime data are still shown, flagged as timetable-only.
 
+Built for small servers: each trip's stop times are packed into one binary row, an R-tree over
+(time, lat, lon) finds the trips that cross the visible map area, and the realtime feed is only
+indexed by trip id; a trip's updates are decoded when that trip is actually on screen.
+
 Usage:
-    python3 buses.py            # print the vehicles currently in the area
+    python3 buses.py            # print the vehicles currently around Osnabrück
     python3 buses.py refresh    # force a refresh of the static timetable cache (~270 MB download)
 
 Only stdlib: the protobuf subset we need is decoded by hand.
@@ -25,20 +29,24 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from array import array
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 STATIC_URL = "https://download.gtfs.de/germany/free/latest.zip"
 RT_URL = "https://realtime.gtfs.de/realtime-free.pb"
-GTFS_DB = Path(__file__).with_name("gtfs.db")
-SHOW_BBOX = (51.38, 6.85, 52.80, 8.54)  # vehicles shown: same area as collector.BBOX (Quakenbrück to Essen)
-STOP_BBOX = (51.28, 6.65, 52.90, 8.70)  # stops kept: area + margin; plus each trip's first stop beyond it
+GTFS_DB = Path(__file__).with_name("gtfs-de.db")
 RT_MIN_INTERVAL_S = 60
 STATIC_MAX_AGE_S = 7 * 24 * 3600
 MAX_DELAY_S = 1800  # look this far around the timetable for trips that may still be running late
 VEHICLE_CACHE_S = 10
+MAX_ALL_MODES_DEG2 = 12  # larger requested areas get trains only, so a zoomed-out Germany stays light
 TZ = ZoneInfo("Europe/Berlin")
-UA = "osna-sensors/0.2 (private research collector)"
+UA = "germasense/0.2 (+https://github.com/ishallnotforget)"
+
+
+def is_rail(route_type):
+    return route_type == 2 or 100 <= route_type < 200
 
 
 # --- static timetable cache -------------------------------------------------------------------
@@ -100,8 +108,12 @@ def hms(s):
     return int(h) * 3600 + int(m) * 60 + int(sec)
 
 
-def refresh_static():
-    """Rebuild gtfs.db from the national GTFS zip, keeping only stops and stop times inside STOP_BBOX."""
+def refresh_static(log=lambda *a: None):
+    """Rebuild gtfs.db from the national GTFS zip.
+
+    trip_times holds one row per trip: its time span, bounding box and a packed int32 array
+    [stop indexes..., arrivals..., departures...]. trip_rt / trip_rt_rail are R-trees over it.
+    """
     remote = RemoteFile(STATIC_URL)
     z = zipfile.ZipFile(io.BufferedReader(remote, buffer_size=4 << 20))
     rows = lambda name: csv.DictReader(io.TextIOWrapper(z.open(name), encoding="utf-8-sig"))
@@ -109,25 +121,30 @@ def refresh_static():
     tmp.unlink(missing_ok=True)
     db = sqlite3.connect(tmp)
     db.executescript("""
-        CREATE TABLE stops (stop_id TEXT PRIMARY KEY, name TEXT, lat REAL, lon REAL);
+        PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF;
+        CREATE TABLE stops (idx INTEGER PRIMARY KEY, stop_id TEXT, name TEXT, lat REAL, lon REAL);
         CREATE TABLE routes (route_id TEXT PRIMARY KEY, name TEXT, agency TEXT, type INTEGER);
         CREATE TABLE trips (trip_id TEXT PRIMARY KEY, route_id TEXT, service_id TEXT) WITHOUT ROWID;
         CREATE TABLE calendar (service_id TEXT, days TEXT, start TEXT, end TEXT);
         CREATE TABLE calendar_dates (service_id TEXT, date TEXT, exception INTEGER);
-        CREATE TABLE stop_times (trip_id TEXT, seq INTEGER, stop_id TEXT, arr INTEGER, dep INTEGER,
-                                 PRIMARY KEY (trip_id, seq)) WITHOUT ROWID;
+        CREATE TABLE trip_times (id INTEGER PRIMARY KEY, trip_id TEXT, data BLOB);
+        CREATE VIRTUAL TABLE trip_rt USING rtree (id, t0, t1, lat0, lat1, lon0, lon1);
+        CREATE VIRTUAL TABLE trip_rt_rail USING rtree (id, t0, t1, lat0, lat1, lon0, lon1);
         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
     """)
-    lat0, lon0, lat1, lon1 = STOP_BBOX
-    all_stops, stops = {}, set()
+    stop_idx, lats, lons, stop_rows = {}, array("d"), array("d"), []
     for r in rows("stops.txt"):
         try:
             lat, lon = float(r["stop_lat"]), float(r["stop_lon"])
         except ValueError:
             continue
-        all_stops[r["stop_id"]] = (r["stop_name"], lat, lon)
-        if lat0 < lat < lat1 and lon0 < lon < lon1:
-            stops.add(r["stop_id"])
+        stop_idx[r["stop_id"]] = len(lats)
+        stop_rows.append((len(lats), r["stop_id"], r["stop_name"], lat, lon))
+        lats.append(lat)
+        lons.append(lon)
+    db.executemany("INSERT INTO stops VALUES (?,?,?,?,?)", stop_rows)
+    del stop_rows
+    log(f"{len(lats)} stops")
     agencies = {r["agency_id"]: r["agency_name"] for r in rows("agency.txt")}
     db.executemany("INSERT OR IGNORE INTO routes VALUES (?,?,?,?)",
                    ((r["route_id"], r["route_short_name"] or r["route_long_name"], agencies.get(r["agency_id"], ""),
@@ -138,48 +155,60 @@ def refresh_static():
                     for r in rows("calendar.txt")))
     db.executemany("INSERT INTO calendar_dates VALUES (?,?,?)",
                    ((r["service_id"], r["date"], int(r["exception_type"])) for r in rows("calendar_dates.txt")))
-    # stop_times is ~2 GB raw: plain csv.reader with fixed column positions, keep only stops in the area.
-    # Rows come grouped by trip in stop order, so we also keep the stop just before entering and just after
-    # leaving the area: a train from Osnabrück to Bremen then stays on the map until it is out of view.
-    reader = csv.reader(io.TextIOWrapper(z.open("stop_times.txt"), encoding="utf-8-sig"))
+    db.executemany("INSERT OR IGNORE INTO trips VALUES (?,?,?)",
+                   ((r["trip_id"], r["route_id"], r["service_id"]) for r in rows("trips.txt")))
+    db.commit()
+    log("routes, calendars and trips loaded; packing stop_times")
+
+    # stop_times is ~2 GB raw and arrives grouped by trip: pack each trip as soon as the next one starts.
+    reader = csv.reader(io.TextIOWrapper(z.open("stop_times.txt"), encoding="utf-8-sig"), )
     head = next(reader)
     ti, ai, di, si, qi = (head.index(c) for c in ("trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"))
-    trip_ids, used_stops, batch = set(), set(), []
+    batch, rtree, n_trips = [], [], 0
+    cur_trip, cur = None, []
 
-    def keep(r):
-        arr = hms(r[ai] or r[di])
-        batch.append((r[ti], int(r[qi]), r[si], arr, hms(r[di]) if r[di] else arr))
-        trip_ids.add(r[ti])
-        used_stops.add(r[si])
-
-    prev, prev_in, prev_kept = None, False, False
-    for r in reader:
-        inside = r[si] in stops
-        same_trip = prev is not None and prev[ti] == r[ti]
-        if same_trip and inside and not prev_in and not prev_kept:
-            keep(prev)  # entering the area
-        if inside or (same_trip and prev_in):  # inside, or the first stop after leaving
-            keep(r)
-            kept = True
-        else:
-            kept = False
-        prev, prev_in, prev_kept = r, inside, kept
-        if len(batch) >= 50000:
-            db.executemany("INSERT OR IGNORE INTO stop_times VALUES (?,?,?,?,?)", batch)
+    def flush():
+        nonlocal n_trips
+        cur.sort()
+        idx = [c[1] for c in cur]
+        arr = [c[2] for c in cur]
+        dep = [c[3] for c in cur]
+        packed = array("i", idx + arr + dep).tobytes()
+        la = [lats[i] for i in idx]
+        lo = [lons[i] for i in idx]
+        n_trips += 1
+        batch.append((n_trips, cur_trip, packed))
+        rtree.append((n_trips, min(dep), max(arr), min(la), max(la), min(lo), max(lo)))
+        if len(batch) >= 20000:
+            db.executemany("INSERT INTO trip_times VALUES (?,?,?)", batch)
+            db.executemany("INSERT INTO trip_rt VALUES (?,?,?,?,?,?,?)", rtree)
             batch.clear()
-    db.executemany("INSERT OR IGNORE INTO stop_times VALUES (?,?,?,?,?)", batch)
-    db.executemany("INSERT OR IGNORE INTO stops VALUES (?,?,?,?)",
-                   ((sid, *all_stops[sid]) for sid in used_stops | stops if sid in all_stops))
-    db.executemany("INSERT OR IGNORE INTO trips VALUES (?,?,?)",
-                   ((r["trip_id"], r["route_id"], r["service_id"]) for r in rows("trips.txt") if r["trip_id"] in trip_ids))
-    db.executescript("""
-        CREATE TABLE trip_span AS
-            SELECT trip_id, MIN(dep) AS start_s, MAX(arr) AS end_s FROM stop_times GROUP BY trip_id;
-        CREATE INDEX trip_span_time ON trip_span (start_s, end_s);
+            rtree.clear()
+
+    for r in reader:
+        if r[ti] != cur_trip:
+            if len(cur) >= 2:
+                flush()
+            cur_trip, cur = r[ti], []
+        s = stop_idx.get(r[si])
+        if s is None:
+            continue
+        a = hms(r[ai] or r[di])
+        cur.append((int(r[qi]), s, a, hms(r[di]) if r[di] else a))
+    if len(cur) >= 2:
+        flush()
+    db.executemany("INSERT INTO trip_times VALUES (?,?,?)", batch)
+    db.executemany("INSERT INTO trip_rt VALUES (?,?,?,?,?,?,?)", rtree)
+    log(f"{n_trips} trips packed; building indexes")
+    rail = ",".join(str(t) for t in [2] + list(range(100, 200)))
+    db.executescript(f"""
+        INSERT INTO trip_rt_rail SELECT x.* FROM trip_rt x JOIN trip_times tt ON tt.id = x.id
+            JOIN trips t ON t.trip_id = tt.trip_id JOIN routes r ON r.route_id = t.route_id WHERE r.type IN ({rail});
         CREATE INDEX calendar_dates_date ON calendar_dates (date);
     """)
     db.executemany("INSERT INTO meta VALUES (?,?)", [("fetched", str(time.time())), ("source_modified", remote.last_modified)])
     db.commit()
+    db.execute("VACUUM")
     db.close()
     tmp.replace(GTFS_DB)
 
@@ -231,17 +260,11 @@ def stop_event(buf):
     return delay, t
 
 
-def parse_trip_update(buf):
-    """Return (trip_id, cancelled, [(stop_id, (arr_delay, arr_time), (dep_delay, dep_time), skipped)])."""
-    trip_id, cancelled, stus = None, False, []
+def parse_stop_updates(buf):
+    """Decode one TripUpdate's StopTimeUpdates: [(stop_id, (arr_delay, arr_time), (dep_delay, dep_time), skipped)]."""
+    stus = []
     for num, v in fields(buf):
-        if num == 1:  # TripDescriptor
-            for n2, v2 in fields(v):
-                if n2 == 1:
-                    trip_id = bytes(v2).decode()
-                elif n2 == 4 and v2 == 3:  # CANCELED
-                    cancelled = True
-        elif num == 2:  # StopTimeUpdate
+        if num == 2:
             stop_id, arr, dep, skipped = None, (None, None), (None, None), False
             for n2, v2 in fields(v):
                 if n2 == 4:
@@ -253,17 +276,31 @@ def parse_trip_update(buf):
                 elif n2 == 5 and v2 == 1:  # SKIPPED
                     skipped = True
             stus.append((stop_id, arr, dep, skipped))
-    return trip_id, cancelled, stus
+    return stus
 
 
-def iter_trip_updates(feed):
+def index_trip_updates(feed):
+    """Only read each TripUpdate's TripDescriptor: returns ({trip_id: raw TripUpdate}, cancelled trip ids)."""
     buf = memoryview(feed)
+    raw, cancelled = {}, set()
     for num, entity in fields(buf):
         if num != 2:
             continue
-        for n2, v2 in fields(entity):
-            if n2 == 3:
-                yield parse_trip_update(v2)
+        for n2, tu in fields(entity):
+            if n2 != 3:
+                continue
+            for n3, desc in fields(tu):
+                if n3 == 1:
+                    trip_id, canc = None, False
+                    for n4, v4 in fields(desc):
+                        if n4 == 1:
+                            trip_id = bytes(v4).decode()
+                        elif n4 == 4 and v4 == 3:  # CANCELED
+                            canc = True
+                    if trip_id:
+                        (cancelled.add(trip_id) if canc else raw.__setitem__(trip_id, tu))
+                    break  # the descriptor comes first; the stop updates are decoded later, on demand
+    return raw, cancelled
 
 
 # --- live state --------------------------------------------------------------------------------
@@ -280,13 +317,14 @@ class Buses:
         self.fetched_at = 0.0
         self.last_modified = None
         self.feed_time = None
-        self.rt = {}            # trip_id -> list of stop time updates
+        self.rt_raw = {}        # trip_id -> undecoded TripUpdate
+        self.rt = {}            # trip_id -> decoded stop updates, filled on demand
         self.cancelled = set()
         self.error = None
         self.static_error = None
         self.services = {}      # date -> set of active service_ids
         self.static_thread = None
-        self.cache, self.cache_at = None, 0.0
+        self.cache = {}         # (bbox, rail_only) -> (time, result)
         self.stops, self.stops_db_mtime = None, None
 
     # static timetable: refreshed in the background, the map keeps working meanwhile
@@ -330,14 +368,19 @@ class Buses:
             try:
                 feed = self._fetch()
                 if feed is not None:
-                    rt, cancelled = {}, set()
-                    for trip_id, canc, stus in iter_trip_updates(feed):
-                        (cancelled.add(trip_id) if canc else rt.__setitem__(trip_id, stus))
-                    self.rt, self.cancelled = rt, cancelled
+                    self.rt_raw, self.cancelled = index_trip_updates(feed)
+                    self.rt = {}
+                    self.cache.clear()
                     self.feed_time = email.utils.parsedate_to_datetime(self.last_modified).isoformat()
                 self.error = None
             except Exception as e:
                 self.error = f"{type(e).__name__}: {e}"
+
+    def _updates(self, trip_id):
+        if trip_id not in self.rt:
+            raw = self.rt_raw.get(trip_id)
+            self.rt[trip_id] = parse_stop_updates(raw) if raw is not None else None
+        return self.rt[trip_id]
 
     def _active_services(self, db, date):
         if date not in self.services:
@@ -349,7 +392,8 @@ class Buses:
             self.services[date] = active
         return self.services[date]
 
-    def _timeline(self, sched, rt):
+    @staticmethod
+    def _timeline(sched, rt):
         """Merge scheduled stops [(stop_id, arr, dep)] with realtime updates. Delays propagate downstream."""
         updates = {}
         for stop_id, (ad, at), (dd, dtm), skipped in rt or []:
@@ -371,84 +415,103 @@ class Buses:
             out.append((stop_id, arr + (delay or 0), dep + (delay or 0), delay))
         return out
 
-    def vehicles(self, now=None, bbox=None):
-        """Current segment per vehicle, optionally only those touching bbox (lat0, lon0, lat1, lon1).
+    def vehicles(self, now=None, bbox=None, rail_only=False):
+        """Current segment of every vehicle in bbox (lat0, lon0, lat1, lon1).
 
-        The full list is computed at most every VEHICLE_CACHE_S; the client animates in between.
+        Areas larger than MAX_ALL_MODES_DEG2 get trains only. Results are cached per area for
+        VEHICLE_CACHE_S; the client animates in between.
         """
         self.refresh()
         now = now or time.time()
         if static_age_s() == float("inf"):
             return {"now": now, "feed_time": self.feed_time, "error": self.error or self.static_error,
                     "loading": True, "vehicles": []}
+        bbox = bbox or (47.2, 5.8, 55.1, 15.1)
+        lat0, lon0, lat1, lon1 = bbox
+        rail_only = rail_only or (lat1 - lat0) * (lon1 - lon0) > MAX_ALL_MODES_DEG2
+        key = (tuple(round(x, 2) for x in bbox), rail_only)
         with self.lock:
-            if now - self.cache_at > VEHICLE_CACHE_S:
-                self.cache, self.cache_at = self._compute(now), now
-            res = self.cache
-        if bbox:
-            lat0, lon0, lat1, lon1 = bbox
-            inside = lambda p: lat0 <= p[0] <= lat1 and lon0 <= p[1] <= lon1
-            res = {**res, "vehicles": [v for v in res["vehicles"] if inside(v["from"]) or inside(v["to"])]}
-        return {**res, "now": now}
+            hit = self.cache.get(key)
+            if not hit or now - hit[0] > VEHICLE_CACHE_S:
+                if len(self.cache) > 64:
+                    self.cache.clear()
+                hit = (now, self._compute(now, bbox, rail_only))
+                self.cache[key] = hit
+        return {**hit[1], "now": now, "rail_only": rail_only}
 
-    def _compute(self, now):
-        db = sqlite3.connect(GTFS_DB)
+    def _load_stops(self, db):
         if self.stops is None or self.stops_db_mtime != GTFS_DB.stat().st_mtime:
-            self.stops = {sid: (name, lat, lon) for sid, name, lat, lon in db.execute("SELECT * FROM stops")}
+            ids, names, lats, lons = [], [], array("d"), array("d")
+            for _, sid, name, lat, lon in db.execute("SELECT * FROM stops ORDER BY idx"):
+                ids.append(sid)
+                names.append(name)
+                lats.append(lat)
+                lons.append(lon)
+            self.stops = (ids, names, lats, lons)
             self.stops_db_mtime = GTFS_DB.stat().st_mtime
-        stops = self.stops
+            self.services.clear()
+        return self.stops
+
+    def _compute(self, now, bbox, rail_only):
+        db = sqlite3.connect(f"file:{GTFS_DB}?mode=ro", uri=True)
+        ids, names, lats, lons = self._load_stops(db)
+        lat0, lon0, lat1, lon1 = bbox
+        inside = lambda i: lat0 <= lats[i] <= lat1 and lon0 <= lons[i] <= lon1
         today = dt.datetime.fromtimestamp(now, TZ).date()
-        lat0, lon0, lat1, lon1 = SHOW_BBOX
         out, seen = [], set()
         for date in (today, today - dt.timedelta(days=1)):
             midnight = service_midnight(date)
             services = self._active_services(db, date)
             t = now - midnight
-            # one query for all candidate trips' stop times instead of one per trip (thousands in the Ruhr)
-            info, sched_by_trip = {}, {}
-            for trip_id, service_id, line, agency, rtype, stop_id, arr, dep in db.execute("""
-                    SELECT s.trip_id, t.service_id, r.name, r.agency, r.type, st.stop_id, st.arr, st.dep
-                    FROM trip_span s JOIN trips t USING (trip_id) LEFT JOIN routes r USING (route_id)
-                    JOIN stop_times st ON st.trip_id = s.trip_id
-                    WHERE s.start_s <= ? AND s.end_s >= ? ORDER BY st.trip_id, st.seq""",
-                    (t + 300, t - MAX_DELAY_S)):
-                if service_id not in services:
+            for trip_id, data, service_id, line, agency, rtype in db.execute(f"""
+                    SELECT tt.trip_id, tt.data, t.service_id, r.name, r.agency, r.type
+                    FROM {"trip_rt_rail" if rail_only else "trip_rt"} x
+                    JOIN trip_times tt ON tt.id = x.id
+                    JOIN trips t ON t.trip_id = tt.trip_id LEFT JOIN routes r ON r.route_id = t.route_id
+                    WHERE x.t0 <= ? AND x.t1 >= ? AND x.lat0 <= ? AND x.lat1 >= ? AND x.lon0 <= ? AND x.lon1 >= ?""",
+                    (t + 300, t - MAX_DELAY_S, lat1, lat0, lon1, lon0)):
+                if service_id not in services or trip_id in self.cancelled or trip_id in seen:
                     continue
-                info[trip_id] = (line, agency, rtype)
-                sched_by_trip.setdefault(trip_id, []).append((stop_id, midnight + arr, midnight + dep))
-            for trip_id, sched in sched_by_trip.items():
-                if trip_id in self.cancelled or trip_id in seen:
-                    continue
-                line, agency, rtype = info[trip_id]
-                live = trip_id in self.rt
-                tl = self._timeline(sched, self.rt.get(trip_id))
-                for a, b in zip(tl, tl[1:]):
-                    if a[2] <= now <= b[1] or a[1] <= now <= a[2]:
+                a = array("i")
+                a.frombytes(data)
+                n = len(a) // 3
+                idx = a[:n]
+                sched = [(ids[s], midnight + ar, midnight + dp) for s, ar, dp in zip(idx, a[n:2 * n], a[2 * n:])]
+                rt = self._updates(trip_id)
+                tl = self._timeline(sched, rt)
+                for k in range(len(tl) - 1):
+                    p, q = tl[k], tl[k + 1]
+                    if p[2] <= now <= q[1] or p[1] <= now <= p[2]:
                         break
                 else:
                     continue
-                pa, pb = stops[a[0]], stops[b[0]]
-                if not any(lat0 < p[1] < lat1 and lon0 < p[2] < lon1 for p in (pa, pb)):
+                pos = {s: i for s, i in zip((ids[i] for i in idx), idx)}
+                ia, ib = pos[p[0]], pos[q[0]]
+                if not (inside(ia) or inside(ib)):
                     continue
                 seen.add(trip_id)
+                live = rt is not None
                 out.append({"trip": trip_id, "line": line or "?", "agency": agency or "", "type": rtype or 3,
-                            "headsign": stops[tl[-1][0]][0], "live": live, "delay": b[3] if live else None,
-                            "from": [pa[1], pa[2]], "to": [pb[1], pb[2]],
-                            "dep": a[2], "arr": b[1], "prev_stop": pa[0], "next_stop": pb[0]})
+                            "headsign": names[pos[tl[-1][0]]], "live": live, "delay": q[3] if live else None,
+                            "from": [lats[ia], lons[ia]], "to": [lats[ib], lons[ib]],
+                            "dep": p[2], "arr": q[1], "prev_stop": names[ia], "next_stop": names[ib]})
         db.close()
         return {"feed_time": self.feed_time, "error": self.error or self.static_error, "vehicles": out}
 
 
 if __name__ == "__main__":
     if sys.argv[1:] == ["refresh"] or static_age_s() == float("inf"):
-        print("Fetching timetable (one-off ~270 MB, a few minutes)…")
-        refresh_static()
-    res = Buses().vehicles()
+        print("Fetching timetable (one-off ~270 MB, several minutes)…")
+        t0 = time.time()
+        refresh_static(log=lambda m: print(f"  {time.time() - t0:5.0f}s {m}"))
+    b = Buses()
+    t0 = time.time()
+    res = b.vehicles(bbox=(52.15, 7.9, 52.4, 8.2))  # Osnabrück
+    print(f"computed in {time.time() - t0:.2f}s")
     if res["error"]:
         print("ERROR", res["error"])
     live = sum(v["live"] for v in res["vehicles"])
-    print(f"{len(res['vehicles'])} vehicles ({live} with live data), feed {res['feed_time']}")
-    for v in sorted(res["vehicles"], key=lambda v: v["line"]):
-        if v["agency"].startswith("Verkehrsgemeinschaft Osna"):
-            d = f"{round(v['delay'] / 60):+d} min" if v["live"] and v["delay"] is not None else "timetable"
-            print(f"  {v['line']:>6} → {v['headsign'][:26]:26} {v['prev_stop'][:22]:22} → {v['next_stop'][:22]:22} {d}")
+    print(f"{len(res['vehicles'])} vehicles around Osnabrück ({live} with live data), feed {res['feed_time']}")
+    for v in sorted(res["vehicles"], key=lambda v: v["line"])[:40]:
+        d = f"{round(v['delay'] / 60):+d} min" if v["live"] and v["delay"] is not None else "timetable"
+        print(f"  {v['line']:>6} → {v['headsign'][:26]:26} {v['prev_stop'][:22]:22} → {v['next_stop'][:22]:22} {d}")

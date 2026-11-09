@@ -1,8 +1,6 @@
 # local data, rebuilt automatically
-osna.db
-osna.db-*
-gtfs.db
-gtfs.tmp
-gtfs.db-*
+*.db
+*.db-*
+*.tmp
 __pycache__/
 *.zip
