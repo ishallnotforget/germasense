@@ -111,7 +111,7 @@ Open `http://<server-ip>:8642` from any device on your network. There is no logi
   - **Flugzeuge:** aircraft over Germany, updated every 10 s and moved smoothly in between. Grey ones are on the ground.
   - **Erdbeben:** earthquakes of the last 30 days. Filled circles are from the last 24 hours.
   - **Autobahn:** current roadworks, closures, accidents and traffic warnings, and fast chargers, drawn as rings.
-  - **Mobilfunk:** mobile coverage per network (Telekom, Vodafone, O2, 1&1) or the best of all networks, coloured by the best technology (2G, 4G, 5G, 5G Standalone; for 1&1 also roaming). This is the operators' own outdoor coverage as reported to the Bundesnetzagentur, **not live**; the layer list and the legend show its date, e.g. "Stand 06.2026". It is updated about every quarter.
+  - **Mobilfunk:** mobile coverage per network (Telekom, Vodafone, O2, 1&1) or the best of all networks, coloured by the best technology (2G, 4G, 5G, 5G Standalone; for 1&1 also roaming). Buttons in the legend switch a network's map to 5G, 4G (LTE) or 2G only. This is the operators' own outdoor coverage as reported to the Bundesnetzagentur, **not live**; the layer list and the legend show its date, e.g. "Stand 06.2026". It is updated about every quarter.
 
 ## Data sources
 

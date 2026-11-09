@@ -114,7 +114,12 @@ a { color: var(--series-1); }
 .plane.ground { color: var(--muted); }
 .plane svg { width: 100%; height: 100%; display: block; }
 .covleg .row { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
-.covleg img { width: 14px; height: 14px; }
+.covleg { max-width: 300px; }
+.covleg img { width: 14px; height: 14px; flex: none; }
+.covleg .techs { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0 4px; }
+.covleg .techs button { font-size: 12px; padding: 2px 6px; }
+.covleg .techs button[aria-pressed="true"] { border-color: var(--series-1); color: var(--series-1); }
+.covleg .techs button:disabled { opacity: .4; cursor: default; }
 .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--surface-1); color: var(--text-primary); }
 .leaflet-popup-content { margin: 10px 12px; max-width: 320px; font-size: 12px; white-space: pre-line; }
 .leaflet-popup-content b { font-size: 13px; }
@@ -604,6 +609,7 @@ const UTM = (() => {
 const UTM_ORIGIN = [-5120900, 900709927374.099], UTM_RES = [0, 1, 2, 3, 4, 5, 6, 7, 8].map(l => 1270.0025400050802 / 2 ** l);
 const UtmTiles = L.Layer.extend({
   initialize(service, opacity) { this.service = service; this.opacity = opacity; this.imgs = new Map(); },
+  setService(service) { if (service !== this.service) { this.service = service; this.imgs.clear(); this.draw(); } },
   onAdd(map) {
     this.canvas = L.DomUtil.create("canvas", "leaflet-zoom-hide");
     Object.assign(this.canvas.style, { position: "absolute", opacity: this.opacity, pointerEvents: "none", filter: "saturate(1.2)" });
@@ -646,32 +652,54 @@ const UtmTiles = L.Layer.extend({
     }
   },
 });
-const COVERAGE = { AllTech: "alle Netze (beste Technik)", DT_AllTech: "Telekom", VF_AllTech: "Vodafone",
-                   TF_AllTech: "O2 (Telefónica)", "1u1_AllTech": "1&1" };
+// One layer per network; the technology (best available, 5G, 4G, 2G) is picked in the legend and applies to all.
+const COVERAGE = { All: "alle Netze (beste Technik)", DT: "Telekom", VF: "Vodafone", TF: "O2 (Telefónica)", "1u1": "1&1" };
+const COV_TECH = { AllTech: "beste Technik", Tech5G: "5G", Tech4G: "4G (LTE)", Tech2G: "2G" };
+let covTech = COV_TECH[store.get("covTech")] ? store.get("covTech") : "AllTech";
+const covService = op => op === "All" ? "AllTech" : `${op}_${covTech}`;  // the all-networks map only has "best"
 let coverageDate = null;
+const covLegends = {};  // service -> legend entries from the Bundesnetzagentur server
 const coverageLegend = L.control({ position: "bottomleft" });
-coverageLegend.onAdd = () => L.DomUtil.create("div", "legend covleg");
-for (const [svc, name] of Object.entries(COVERAGE)) overlays["cov_" + svc] = { name: `Mobilfunk: ${name}`,
-  layer: new UtmTiles(svc, 0.55), every: 86400, legend: null, async load() {
+coverageLegend.onAdd = () => {
+  const d = L.DomUtil.create("div", "legend covleg");
+  L.DomEvent.disableClickPropagation(d);
+  return d;
+};
+const covLegend = async svc => covLegends[svc] ??= fetch(`${BNETZA}/${svc}/MapServer/legend?f=json`).then(r => r.json())
+  .then(lg => lg.layers.flatMap(l => l.legend).filter(x => !["---", "0", "0,0"].includes(x.label)));
+// Overlay keys stay "cov_<op>_AllTech" so layers saved in the browser before the technology choice still load
+for (const op of Object.keys(COVERAGE)) overlays[`cov_${op === "All" ? "" : op + "_"}AllTech`] = {
+  name: `Mobilfunk: ${COVERAGE[op]}`, op, layer: new UtmTiles(covService(op), 0.55), every: 86400, async load() {
     if (!coverageDate) coverageDate = (await api("layer/coverage")).date;
-    if (!this.legend) {
-      const lg = await fetch(`${BNETZA}/${svc}/MapServer/legend?f=json`).then(r => r.json());
-      this.legend = lg.layers.flatMap(l => l.legend).filter(x => x.label !== "---");
-    }
+    this.layer.setService(covService(op));
+    await covLegend(covService(op));
     showCoverageLegend();
-    return coverageDate ? `Stand ${coverageDate}` : "";
+    return [op === "All" ? "" : COV_TECH[covTech], coverageDate && `Stand ${coverageDate}`].filter(Boolean).join(" · ");
   } };
-const COV_LABEL = { "2G": "2G", "4G": "4G", "5G": "5G", "SA": "5G Standalone",
-                    "2G_RO": "2G über Roaming", "4G_RO": "4G über Roaming", "5G_RO": "5G über Roaming" };
-function showCoverageLegend() {
-  const on = Object.keys(COVERAGE).map(s => overlays["cov_" + s]).filter(o => map.hasLayer(o.layer));
+const covOverlays = () => Object.values(overlays).filter(o => o.op);
+const COV_LABEL = { "4G": "4G (LTE)", "SA": "5G Standalone", "2G_RO": "2G über Roaming", "4G_RO": "4G (LTE) über Roaming",
+                    "5G_RO": "5G über Roaming", "1,0": "eigenes Netz", "0,1": "nur über Roaming", "1,1": "eigenes Netz und Roaming" };
+async function showCoverageLegend() {
+  const on = covOverlays().filter(o => map.hasLayer(o.layer));
   if (!on.length) { coverageLegend.remove(); return; }
-  const o = on[on.length - 1];
+  const o = on[on.length - 1], svc = covService(o.op), tech = o.op === "All" ? "AllTech" : covTech;
+  const entries = await covLegend(svc);
+  const label = x => x.label === "1" ? `${COV_TECH[tech]} verfügbar` : COV_LABEL[x.label] || x.label;
   if (!coverageLegend._map) coverageLegend.addTo(map);
-  coverageLegend.getContainer().innerHTML = `<b>${esc(o.name)}</b>
-    <div class="sub">Netzbetreiber-Angaben, nicht live · Stand ${esc(coverageDate || "?")}</div>
-    ${(o.legend || []).map(x => `<div class="row"><img src="data:${x.contentType};base64,${x.imageData}" alt="">${esc(COV_LABEL[x.label] || x.label)}</div>`).join("")}
-    <div class="sub">© Bundesnetzagentur</div>`;
+  const el = coverageLegend.getContainer();
+  el.innerHTML = `<b>${esc(o.name)}</b>
+    <div class="techs" role="group" aria-label="Technik">${Object.entries(COV_TECH).map(([k, v]) =>
+      `<button data-t="${k}" aria-pressed="${k === covTech}"${o.op === "All" && k !== "AllTech" ? " disabled title=\"Nur je Netz verfügbar\"" : ""}>${esc(v)}</button>`).join("")}</div>
+    ${o.op === "1u1" && tech !== "AllTech"
+      // The 1&1 per-technology maps encode own network and Vodafone national roaming in internal codes ("5G,0,1");
+      // the official map explains them by look, so do the same
+      ? `<div class="row">Kräftige Farbe: eigenes 1&amp;1-Netz</div><div class="row">Schraffiert, heller: National Roaming im Vodafone-Netz (für Bestandskunden)</div>`
+      : entries.map(x => `<div class="row"><img src="data:${x.contentType};base64,${x.imageData}" alt="">${esc(label(x))}</div>`).join("")}
+    <div class="sub">Angaben der Netzbetreiber, nicht live · Stand ${esc(coverageDate || "?")}<br>© Bundesnetzagentur</div>`;
+  el.querySelectorAll(".techs button").forEach(b => b.onclick = () => {
+    covTech = b.dataset.t; store.set("covTech", covTech);
+    for (const c of covOverlays()) if (map.hasLayer(c.layer)) ovLoad(Object.keys(overlays).find(k => overlays[k] === c));
+  });
 }
 map.on("overlayremove", showCoverageLegend);
 
