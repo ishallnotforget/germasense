@@ -684,7 +684,8 @@ async function showCoverageLegend() {
   if (!on.length) { coverageLegend.remove(); return; }
   const o = on[on.length - 1], svc = covService(o.op), tech = o.op === "All" ? "AllTech" : covTech;
   const entries = await covLegend(svc);
-  const label = x => x.label === "1" ? `${COV_TECH[tech]} verfügbar` : COV_LABEL[x.label] || x.label;
+  // Per-technology maps label coverage "1" or "1 - 4" (the latter is left over from the count-of-networks maps)
+  const label = x => /^1( - \d)?$/.test(x.label) ? `${COV_TECH[tech]} verfügbar` : COV_LABEL[x.label] || x.label;
   if (!coverageLegend._map) coverageLegend.addTo(map);
   const el = coverageLegend.getContainer();
   el.innerHTML = `<b>${esc(o.name)}</b>
