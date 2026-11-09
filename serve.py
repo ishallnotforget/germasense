@@ -30,9 +30,11 @@ COLLECT_EVERY_S = 600
 MAX_AGE_S = 6 * 3600  # readings older than this are not shown as "current" on the map
 
 # Physically plausible ranges; cheap sensors report e.g. -40 °C or 999.9 µg/m³ when broken
-PLAUSIBLE = {"temperature": (-30, 50), "air_temperature": (-30, 50), "dew_point": (-40, 35),
-             "humidity": (0.5, 100), "relative_humidity": (0.5, 100), "pressure": (850, 1090),
-             "pressure_msl": (900, 1090), "pm10": (0, 999), "pm2_5": (0, 999), "pm1": (0, 999), "co2": (250, 10000)}
+PLAUSIBLE = {"temperature": (-30, 50), "dew_point": (-40, 35), "soil_temperature": (-20, 45),
+             "humidity": (0.5, 100), "soil_moisture": (0, 100), "pressure": (700, 1090), "pressure_msl": (900, 1090),
+             "pm10": (0, 999), "pm2_5": (0, 999), "pm1": (0, 999), "pm4": (0, 999), "co2": (250, 10000),
+             "wind_speed": (0, 200), "wind_gust": (0, 250), "wind_direction": (0, 360), "noise": (20, 140),
+             "rain_rate": (0, 300), "illuminance": (0, 200000)}
 
 
 def db():

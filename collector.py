@@ -64,7 +64,63 @@ def connect(path=DB_PATH):
     db.executescript(SCHEMA)
     db.execute("PRAGMA synchronous = NORMAL")
     db.execute("PRAGMA cache_size = -32000")  # 32 MB
+    if not db.execute("SELECT 1 FROM kv WHERE key = 'quantities_v2'").fetchone():
+        merge_quantities(db)
     return db
+
+
+def merge_quantities(db):
+    """One-time migration for databases from before ALIASES/osm_quantity: move each old quantity's readings to its
+    shared name (converting units), and drop the ones that aren't environmental measurements."""
+    sources = {}
+    for qid, source in db.execute("SELECT DISTINCT l.qid, s.source FROM latest l JOIN stations s ON s.id = l.sid"):
+        sources.setdefault(qid, set()).add(source)
+    ids = dict(db.execute("SELECT name, id FROM quantities"))
+    for qid, name, unit in db.execute("SELECT id, name, unit FROM quantities").fetchall():
+        src = sources.get(qid, set())
+        if name in ALIASES:
+            target = (ALIASES[name], 1)
+        elif name.startswith("pegel_"):
+            target = None
+        elif src == {"opensensemap"}:
+            target = osm_quantity(name[4:] if name.startswith("osm_") else name, unit)
+        elif name in UNITS:
+            target = (name, UNIT_FACTORS.get(name, {}).get(unit_key(unit)) or 1)
+        else:
+            continue
+        if target == (name, 1) and (name not in UNITS or unit == UNITS[name]):
+            continue
+        series = [r[0] for r in db.execute("SELECT sid FROM latest WHERE qid = ?", (qid,))]
+        if target and target[0] == name:  # same name, other unit: convert in place
+            f = target[1]
+            for sid in series:
+                db.execute("UPDATE readings SET value = value * ? WHERE sid = ? AND qid = ?", (f, sid, qid))
+                db.execute("UPDATE hourly SET sum = sum * ?, min = min * ?, max = max * ? WHERE sid = ? AND qid = ?",
+                           (f, f, f, sid, qid))
+            db.execute("UPDATE latest SET value = value * ? WHERE qid = ?", (f, qid))
+            db.execute("UPDATE quantities SET unit = ? WHERE id = ?", (UNITS[name], qid))
+            continue
+        if target:
+            new, f = target
+            if new not in ids:
+                ids[new] = db.execute("INSERT INTO quantities (name, unit) VALUES (?,?)",
+                                      (new, UNITS.get(new, unit))).lastrowid
+            tid = ids[new]
+            for sid in series:  # per series, so every statement uses the primary key
+                db.execute("INSERT OR IGNORE INTO readings SELECT sid, ?, ts, value * ? FROM readings WHERE sid = ? AND qid = ?",
+                           (tid, f, sid, qid))
+                db.execute("""INSERT OR IGNORE INTO hourly SELECT sid, ?, hour, sum * ?, n, min * ?, max * ?
+                              FROM hourly WHERE sid = ? AND qid = ?""", (tid, f, f, f, sid, qid))
+            db.execute("""INSERT INTO latest SELECT ?, sid, ts, value * ? FROM latest WHERE qid = ? AND true
+                          ON CONFLICT (qid, sid) DO UPDATE SET ts = excluded.ts, value = excluded.value
+                          WHERE excluded.ts > latest.ts""", (tid, f, qid))
+        for sid in series:
+            db.execute("DELETE FROM readings WHERE sid = ? AND qid = ?", (sid, qid))
+            db.execute("DELETE FROM hourly WHERE sid = ? AND qid = ?", (sid, qid))
+        db.execute("DELETE FROM latest WHERE qid = ?", (qid,))
+        db.execute("DELETE FROM quantities WHERE id = ?", (qid,))
+    db.execute("INSERT OR REPLACE INTO kv VALUES ('quantities_v2', '1')")
+    db.commit()
 
 
 def get(url, params=None, timeout=60):
@@ -128,22 +184,80 @@ def sensor_community():
                 "meta": {"sensor_type": s["sensor_type"]["name"], "location_id": loc["id"]}}, readings)
 
 
-OSM_QUANTITIES = {  # openSenseMap titles are free text; map the common ones
-    "temperatur": "temperature", "rel. luftfeuchte": "humidity", "luftfeuchte": "humidity",
-    "luftdruck": "pressure", "pm10": "pm10", "pm2.5": "pm2_5", "pm1.0": "pm1", "pm4.0": "pm4",
-    "uv-intensität": "uv_intensity", "beleuchtungsstärke": "illuminance", "co2": "co2", "co₂": "co2",
-    "windgeschwindigkeit": "wind_speed", "windrichtung": "wind_direction", "lautstärke": "noise",
-    "bodenfeuchte": "soil_moisture", "bodentemperatur": "soil_temperature",
+# One name per measured thing, whatever the source calls it, so the map shows e.g. all temperature sensors together.
+ALIASES = {"relative_humidity": "humidity", "air_temperature": "temperature", "noise_laeq": "noise",
+           "wind_speed_10": "wind_speed", "wind_direction_10": "wind_direction", "wind_gust_speed_10": "wind_gust"}
+UNIT_FACTORS = {  # quantity -> {unit as sources write it (lowercase, no spaces): factor to the first unit}
+    "wind_speed": {"km/h": 1, "m/s": 3.6, "m*s^-1": 3.6, "kmh": 1, "kn": 1.852, "mph": 1.609},
+    "pressure": {"hpa": 1, "mbar": 1, "pa": 0.01, "kpa": 10},
 }
+UNIT_FACTORS["wind_gust"] = UNIT_FACTORS["wind_speed"]
+UNIT_FACTORS["pressure_msl"] = UNIT_FACTORS["pressure"]
+UNITS = {"wind_speed": "km/h", "wind_gust": "km/h", "pressure": "hPa", "pressure_msl": "hPa", "noise": "dB(A)"}
 
 
-def osm_quantity(title):
-    t = title.strip().lower()
-    for key, q in OSM_QUANTITIES.items():
-        if t.startswith(key):
-            depth = t[len(key):].strip().replace(" ", "")
-            return f"{q}_{depth}" if depth else q
-    return "osm_" + "".join(c if c.isalnum() else "_" for c in t).strip("_")
+def unit_key(unit):
+    return (unit or "").lower().replace(" ", "").replace("μ", "µ")
+
+
+def osm_quantity(title, unit):
+    """openSenseMap sensor titles are free text in many languages ("Rel. Luftfeuchte", "humidity (BME280)", "PM2.5").
+    Returns (quantity, factor to its unit), or None for channels that aren't measurements of the environment
+    (battery, Wi-Fi, GPS, ...) or whose unit doesn't fit."""
+    t, u = title.lower().replace("_", " "), unit_key(unit)
+    has = lambda *words: any(w in t for w in words)
+    if has("batter", "volt", "spannung", "rssi", "signal", "wifi", "latitude", "longitude", "longtitude", "timestamp",
+           "energy", "power", "current", "frequen", "capacity", "gefühlt", "heat index", "spread", "differenz", "vpd"):
+        return None
+    celsius = u in ("°c", "c", "celsius", "°", "grad", "gradcelsius")
+    if has("taupunkt", "dew"):
+        return ("dew_point", 1) if celsius else None
+    if has("boden", "soil"):
+        if has("temp"):
+            return ("soil_temperature", 1) if celsius else None
+        return ("soil_moisture", 1) if has("feucht", "moist") and "%" in u else None
+    if has("wasser", "water"):
+        return ("water_temperature", 1) if has("temp") and celsius else None
+    if has("temp"):
+        return ("temperature", 1) if celsius else None
+    if has("feucht", "humid"):
+        return ("humidity", 1) if "%" in u or "rh" in u else None
+    if has("druck", "pressure") and not has("sound", "schall"):
+        q = "pressure_msl" if re.search(r"\brel\b|relativ|\bnn\b|meeres|msl|sea", t) else "pressure"
+        f = UNIT_FACTORS[q].get(u)
+        return (q, f) if f else None
+    m = re.search(r"pm\s*(\d+)(?:[.,\s](\d))?", t)
+    if m:
+        size = {"10": "pm10", "25": "pm2_5", "2": "pm2_5", "1": "pm1", "01": "pm1", "4": "pm4"}.get(m.group(1))
+        if m.group(1) == "1" and m.group(2) and m.group(2) != "0":
+            size = None
+        return (size, 1) if size and "g/m" in u else None
+    if has("uv"):
+        if u in ("uvi", "index") or has("index"):
+            return "uv_index", 1
+        return ("uv_intensity", 1) if "w/cm" in u else None
+    if "lx" in u or "lux" in u:
+        return "illuminance", 1
+    if "w/m" in u and has("solar", "sonne", "strahlung", "radiation", "global"):
+        return "solar_radiation", 1
+    if has("wind"):
+        if has("richtung", "direction"):
+            return ("wind_direction", 1) if u in ("°", "grad", "deg", "degree") else None
+        q = "wind_gust" if has("böe", "gust") else "wind_speed"
+        f = UNIT_FACTORS[q].get(u)
+        return (q, f) if f else None
+    if has("böe", "gust"):
+        f = UNIT_FACTORS["wind_gust"].get(u)
+        return ("wind_gust", f) if f else None
+    if has("lautst", "noise", "geräusch", "schall", "sound", "lärm") and u.startswith("db"):
+        return "noise", 1
+    if has("co2", "co₂") and u == "ppm":
+        return "co2", 1
+    if u == "µsv/h":
+        return "gamma_dose_rate", 1
+    if has("regen", "rain", "niederschlag") and u == "mm/h":
+        return "rain_rate", 1
+    return None
 
 
 def opensensemap():
@@ -158,8 +272,11 @@ def opensensemap():
         for s in b.get("sensors", []):
             m = s.get("lastMeasurement")
             if m and fresh(m.get("createdAt")):
+                q = osm_quantity(s.get("title") or "", s.get("unit"))
+                if not q:
+                    continue
                 try:
-                    readings.append((epoch(m["createdAt"]), osm_quantity(s["title"]), float(m["value"]), s.get("unit")))
+                    readings.append((epoch(m["createdAt"]), q[0], float(m["value"]) * q[1], s.get("unit")))
                 except (TypeError, ValueError):
                     pass
         yield ({"key": f"osm:{b['_id']}", "name": b["name"], "lat": lat, "lon": lon,
@@ -266,7 +383,7 @@ def pegelonline():
         for t in s["timeseries"]:
             m = t.get("currentMeasurement")
             if m and m.get("value") is not None:
-                q = PEGEL_QUANTITIES.get(t["shortname"], "pegel_" + t["shortname"].lower())
+                q = PEGEL_QUANTITIES.get(t["shortname"])  # rare special gauges (turbidity, ...) are left out
                 readings.append((epoch(m["timestamp"]), q, float(m["value"]), t.get("unit")))
         yield ({"key": f"pegel:{s['uuid']}", "name": f"{s['shortname']} ({s['water']['shortname']})",
                 "lat": s["latitude"], "lon": s["longitude"],
@@ -417,7 +534,8 @@ def store(db, ids, source, items, now):
         sid = db.execute("SELECT id FROM stations WHERE key = ?", (st["key"],)).fetchone()[0]
         seen.add(sid)
         db.executemany("INSERT OR IGNORE INTO batch VALUES (?,?,?,?)",
-                       [(sid, ids.quantity(db, q, unit), ts, v) for ts, q, v, unit in readings])
+                       [(sid, ids.quantity(db, ALIASES.get(q, q), UNITS.get(ALIASES.get(q, q), unit)), ts, v)
+                        for ts, q, v, unit in readings if q])
     # Keep only readings we don't have yet, then fan them out to raw, hourly and latest
     db.execute("""DELETE FROM batch WHERE ts < ? OR EXISTS (SELECT 1 FROM readings r
                   WHERE r.sid = batch.sid AND r.qid = batch.qid AND r.ts = batch.ts)""", (now - RAW_DAYS * 86400,))

@@ -2,7 +2,7 @@
 """Estimated live bus and train positions for all of Germany.
 
 Nobody publishes GPS positions. Instead we combine:
-  * the national timetable (gtfs.de, weekly) -> every trip that should be on the road right now, and
+  * the national timetable (gtfs.de, checked daily for a new version) -> every trip that should be on the road right now, and
   * the free Germany-wide GTFS-Realtime feed (gtfs.de, ~minutely) -> live times/delays for the trips that report them.
 A vehicle between two stops is placed proportionally along the straight line between them.
 Trips without realtime data are still shown, flagged as timetable-only.
@@ -37,7 +37,8 @@ STATIC_URL = "https://download.gtfs.de/germany/free/latest.zip"
 RT_URL = "https://realtime.gtfs.de/realtime-free.pb"
 GTFS_DB = Path(__file__).with_name("gtfs-de.db")
 RT_MIN_INTERVAL_S = 60
-STATIC_MAX_AGE_S = 7 * 24 * 3600
+STATIC_MAX_AGE_S = 7 * 24 * 3600  # rebuild at least this often, even if the server doesn't say it changed
+STATIC_CHECK_S = 24 * 3600  # look this often for a newer timetable (one HEAD request); rebuild only if there is one
 MAX_DELAY_S = 1800  # look this far around the timetable for trips that may still be running late
 VEHICLE_CACHE_S = 10
 MAX_ALL_MODES_DEG2 = 12  # larger requested areas get trains only, so a zoomed-out Germany stays light
@@ -91,16 +92,29 @@ class RemoteFile(io.RawIOBase):
         return len(data)
 
 
-def static_age_s():
+def static_meta(key):
     if not GTFS_DB.exists():
-        return float("inf")
+        return None
     db = sqlite3.connect(GTFS_DB)
     try:
-        row = db.execute("SELECT value FROM meta WHERE key = 'fetched'").fetchone()
+        row = db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
     except sqlite3.OperationalError:
         row = None
     db.close()
-    return time.time() - float(row[0]) if row else float("inf")
+    return row[0] if row else None
+
+
+def static_age_s():
+    fetched = static_meta("fetched")
+    return time.time() - float(fetched) if fetched else float("inf")
+
+
+def static_changed():
+    """True if gtfs.de has published a timetable other than the one in our cache (or doesn't say)."""
+    head = urllib.request.urlopen(urllib.request.Request(STATIC_URL, method="HEAD", headers={"User-Agent": UA}),
+                                  timeout=60)
+    remote = head.headers.get("Last-Modified")
+    return not remote or remote != static_meta("source_modified")
 
 
 def hms(s):
@@ -324,16 +338,26 @@ class Buses:
         self.static_error = None
         self.services = {}      # date -> set of active service_ids
         self.static_thread = None
+        self.static_checked = 0.0
         self.cache = {}         # (bbox, rail_only) -> (time, result)
         self.stops, self.stops_db_mtime = None, None
 
     # static timetable: refreshed in the background, the map keeps working meanwhile
     def _ensure_static(self):
-        if static_age_s() < STATIC_MAX_AGE_S or (self.static_thread and self.static_thread.is_alive()):
+        """Rebuild the cache when it is missing, a week old, or gtfs.de has published a new timetable.
+        The upstream data sometimes has gaps (e.g. a city's weekday lines missing), so a fixed version
+        should reach the map within a day rather than a week."""
+        if self.static_thread and self.static_thread.is_alive():
             return
+        age = static_age_s()
+        if age < STATIC_MAX_AGE_S and time.time() - self.static_checked < STATIC_CHECK_S:
+            return
+        self.static_checked = time.time()
 
         def run():
             try:
+                if age < STATIC_MAX_AGE_S and not static_changed():
+                    return
                 refresh_static()
                 self.services.clear()
                 self.static_error = None

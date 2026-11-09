@@ -53,7 +53,7 @@ To update to a newer version later, run `git pull` in the folder.
 
 **First start:**
 - **Sensors:** the first collection starts right away and takes 1–3 minutes, mostly waiting for openSenseMap. Reload the page after that. The server then collects again every 10 minutes for as long as it runs.
-- **Buses & trains:** the first time someone ticks "Buses & trains", the server downloads the national timetable (about 270 MB) and builds its local cache. This repeats once a week. Until it is done, the vehicle layer stays empty.
+- **Buses & trains:** the first time someone ticks "Buses & trains", the server downloads the national timetable (about 270 MB) and builds its local cache. Once a day it checks whether gtfs.de has published a newer timetable and rebuilds only then, or after a week at the latest. Until the first build is done, the vehicle layer stays empty.
 
 ## Running it on a home server (e.g. HP MicroServer Gen8)
 
@@ -64,7 +64,7 @@ The program is built for small machines. Measured on a desktop PC:
 | Collection run, all of Germany | 1–3 minutes, mostly waiting for openSenseMap; about 3 s of CPU |
 | Sensor map response | about 30 ms, then under 1 ms from cache until the next collection; about 90 KB gzipped |
 | Sensor database | grows to about 750 MB, then stays there: raw readings are kept 2 days, hourly averages 14 days |
-| Timetable cache (weekly) | 720 MB on disk; the build takes about 3 minutes (2 minutes of CPU) with 320 MB peak memory |
+| Timetable cache | 720 MB on disk; the build takes about 3 minutes (2 minutes of CPU) with 320 MB peak memory |
 | Vehicles in view | 30–230 ms (a city up to the whole Ruhr); all trains in Germany 0.2 s per map area, cached 10 s |
 | Extra layers | fetched only while someone has them open; the Autobahn layer takes about 5 s of ~450 small requests every 10 minutes |
 
