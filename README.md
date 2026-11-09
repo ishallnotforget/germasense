@@ -1,6 +1,7 @@
 # GermaSense
 
-A live map of about 12,000 public environmental sensors and every bus, tram and train in Germany.
+A live map of about 12,000 public environmental sensors and every bus, tram and train in Germany,
+with aircraft, Autobahn roadworks and closures, official warnings, rain radar and earthquakes as extra layers.
 It runs on your own computer or a small home server. It needs only Python: no extra packages, no API keys.
 
 ![All trains in Germany, colored by punctuality, over fine-dust sensors](docs/germany-trains.png)
@@ -8,6 +9,8 @@ It runs on your own computer or a small home server. It needs only Python: no ex
 | Berlin: buses, trams, S- and U-Bahn | Osnabrück: city buses with delays |
 |---|---|
 | ![Berlin](docs/berlin-buses.png) | ![Osnabrück](docs/osnabrueck-buses.png) |
+
+![Extra layers: aircraft, rain radar, DWD and NINA warnings, earthquakes, Autobahn closures](docs/layers-germany.png)
 
 ## Installation
 
@@ -63,6 +66,7 @@ The program is built for small machines. Measured on a desktop PC:
 | Sensor database | grows to about 750 MB, then stays there: raw readings are kept 2 days, hourly averages 14 days |
 | Timetable cache (weekly) | 720 MB on disk; the build takes about 3 minutes (2 minutes of CPU) with 320 MB peak memory |
 | Vehicles in view | 30–230 ms (a city up to the whole Ruhr); all trains in Germany 0.2 s per map area, cached 10 s |
+| Extra layers | fetched only while someone has them open; the Autobahn layer takes about 5 s of ~450 small requests every 10 minutes |
 
 A Gen8 Celeron or Xeon is about 2–3 times slower than that per core. That's fine for this load; budget 1 GB of RAM.
 
@@ -101,6 +105,12 @@ Open `http://<server-ip>:8642` from any device on your network. There is no logi
   - Zoom levels: below zoom 9 only trains are shown, coloured dots until zoom 12, line numbers above that.
   - Type line names into the filter field, e.g. `M3`, `RE18` or `107 U11`.
 - **Pollen:** pick one of the 27 DWD forecast regions in the header.
+- **Layers** (button at the top right of the map). Each layer is only fetched while it is switched on.
+  - **Regenradar** and **Unwetterwarnungen:** images straight from DWD. With the warnings on, click anywhere on the map to read the warning for that place.
+  - **Warnungen (NINA):** civil-protection warnings (MoWaS, KATWARN, BIWAPP, flood centres, police), with the affected area.
+  - **Flugzeuge:** aircraft over Germany, updated every 10 s and moved smoothly in between. Grey ones are on the ground.
+  - **Erdbeben:** earthquakes of the last 30 days. Filled circles are from the last 24 hours.
+  - **Autobahn:** current roadworks, closures, accidents and traffic warnings, and fast chargers, drawn as rings.
 
 ## Data sources
 
@@ -115,6 +125,11 @@ Open `http://<server-ip>:8642` from any device on your network. There is no logi
 | [ParkenDD](https://parkendd.de) | Free spaces in car parks of about ten cities | ~150 |
 | DWD pollen forecast | Today's pollen load per region | 27 regions |
 | [gtfs.de](https://gtfs.de) | National timetable and realtime delays | all of Germany |
+| [adsb.lol](https://adsb.lol) (ODbL) | Aircraft positions | ~500 aircraft |
+| [Autobahn GmbH](https://autobahn.api.bund.dev) | Roadworks, closures, traffic warnings, charging stations | ~3,000 items |
+| [NINA / BBK](https://warnung.bund.dev) | Civil-protection warnings | as issued |
+| [DWD GeoServer](https://maps.dwd.de) | Rain radar and weather warnings (map images) | all of Germany |
+| [EMSC](https://www.seismicportal.eu) | Earthquakes | ~100 per month |
 
 Map tiles are © OpenStreetMap contributors.
 
@@ -127,6 +142,7 @@ Please keep the 10-minute collection interval; these are free public services.
 | `serve.py` | Web server and JSON API; runs the collector in the background |
 | `collector.py` | Fetches all sensor sources into `germasense.db`. Run it on its own: `python3 collector.py`, or `python3 collector.py summary` |
 | `buses.py` | Timetable cache and vehicle positions. Rebuild the cache with `python3 buses.py refresh` |
+| `layers.py` | Aircraft, Autobahn, NINA warnings and earthquakes, fetched on demand. Test them with `python3 layers.py` |
 | `static/index.html` | The map |
 
 Vehicle positions are estimated from the timetable and realtime delays, not GPS.

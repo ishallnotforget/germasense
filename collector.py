@@ -82,7 +82,8 @@ def get_json(url, params=None, timeout=60):
 
 def epoch(ts):
     """Timestamp string (ISO, 'Z', space separator or naive UTC) -> unix seconds."""
-    t = dt.datetime.fromisoformat(ts.replace("Z", "+00:00").replace(" ", "T"))
+    # Python 3.9's fromisoformat only takes 3 or 6 fraction digits ("08:06:06.4" fails), and we keep whole seconds anyway
+    t = dt.datetime.fromisoformat(re.sub(r"\.\d+", "", ts.replace("Z", "+00:00").replace(" ", "T")))
     if t.tzinfo is None:
         t = t.replace(tzinfo=dt.timezone.utc)
     return int(t.timestamp())

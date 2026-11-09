@@ -4,7 +4,8 @@
 Usage:
     python3 serve.py [--port 8642] [--host 127.0.0.1] [--no-collect]
 
-Serves static/index.html plus a small JSON API on the SQLite database written by collector.py.
+Serves static/index.html plus a small JSON API on the SQLite database written by collector.py,
+and the live overlays from layers.py (aircraft, Autobahn, warnings, earthquakes).
 While running it also calls the collector every 10 minutes (disable with --no-collect).
 Map responses are cached in memory until the next collection and sent gzipped.
 """
@@ -20,8 +21,10 @@ from pathlib import Path
 
 import buses
 import collector
+import layers
 
 BUSES = buses.Buses()  # fetches the realtime feed lazily, only while someone has the bus layer open
+LAYERS = layers.Layers()  # aircraft, Autobahn, warnings, earthquakes: also fetched only while shown
 STATIC = Path(__file__).with_name("static")
 COLLECT_EVERY_S = 600
 MAX_AGE_S = 6 * 3600  # readings older than this are not shown as "current" on the map
@@ -171,6 +174,8 @@ class Handler(SimpleHTTPRequestHandler):
             return cached(("l", quantity), lambda con: latest_for_quantity(con, quantity))
         if route == "status":
             return cached("s", status)
+        if route.startswith("layer/"):
+            return LAYERS.get(route[6:])
         if route == "buses":
             bbox = tuple(map(float, q["bbox"].split(","))) if q.get("bbox") else None  # lat0,lon0,lat1,lon1
             return json.dumps(BUSES.vehicles(bbox=bbox, rail_only=q.get("rail") == "1"), ensure_ascii=False, separators=(",", ":")).encode()

@@ -110,6 +110,15 @@ a { color: var(--series-1); }
 .veh.nolive { background: var(--surface-1); color: var(--text-secondary); border: 1.5px dashed var(--muted); }
 .busleg div { display: flex; align-items: center; gap: 6px; margin-top: 3px; }
 .busleg .veh { transform: none; border-width: 1px; }
+.plane { width: 18px; height: 18px; margin: -9px 0 0 -9px; color: #2a78d6; filter: drop-shadow(0 0 1px var(--surface-1)) drop-shadow(0 0 1px var(--surface-1)); }
+.plane.ground { color: var(--muted); }
+.plane svg { width: 100%; height: 100%; display: block; }
+.leaflet-popup-content-wrapper, .leaflet-popup-tip { background: var(--surface-1); color: var(--text-primary); }
+.leaflet-popup-content { margin: 10px 12px; max-width: 320px; font-size: 12px; white-space: pre-line; }
+.leaflet-popup-content b { font-size: 13px; }
+.leaflet-control-layers { background: var(--surface-1); color: var(--text-primary); font-size: 13px; }
+.leaflet-control-layers label { margin: 2px 0; }
+.leaflet-control-layers .sub { margin-left: 4px; }
 </style>
 </head>
 <body>
@@ -217,7 +226,7 @@ function render() {
     <div class="ends"><span>≤ ${fmt(sc.lo)}</span><span>≥ ${fmt(sc.hi)}</span></div>`;
   for (const p of points) {
     const m = L.circleMarker([p.lat, p.lon], {
-      radius: r, weight: w, color: css("--surface-1"), fillColor: sc.color(p.value), fillOpacity: 1,
+      radius: r, weight: w, color: css("--surface-1"), fillColor: sc.color(p.value), fillOpacity: 1, bubblingMouseEvents: false,
     }).addTo(layer);
     // Tooltip text is built on hover only: binding 5000 strings up front costs more than drawing the dots
     m.bindTooltip(() => `${esc(p.name)}<br><b>${fmt(p.value)} ${esc(unit || "")}</b> <span class="src">${ago(p.ts)} ago</span>
@@ -479,6 +488,136 @@ const busToggle = document.getElementById("busToggle");
 busToggle.checked = store.get("buses") !== "0";
 busToggle.onchange = () => setBuses(busToggle.checked);
 setBuses(busToggle.checked);
+
+// --- Overlays (layer switcher, top right): live data that is not a sensor reading ---
+// Each one is fetched only while it is switched on; the server caches them for everyone.
+const DWD_WMS = "https://maps.dwd.de/geoserver/dwd/wms";
+const DWD_ATTR = '&copy; <a href="https://www.dwd.de/">DWD</a>';
+map.createPane("areas").style.zIndex = 380;  // warning areas: above the base map, below sensor dots
+const wms = (layers, opacity) => L.tileLayer.wms(DWD_WMS, { layers, format: "image/png", transparent: true, opacity,
+  attribution: DWD_ATTR, pane: "areas", tileSize: 512, zoomOffset: -1 });
+const fmtTime = ts => new Date(ts * 1000).toLocaleString("de-DE", { dateStyle: "short", timeStyle: "short" });
+const popup = (title, ...lines) => `<b>${esc(title)}</b>\n` + lines.filter(Boolean).map(esc).join("\n");
+
+const overlays = {
+  radar: { name: "Regenradar (DWD)", layer: wms("dwd:Niederschlagsradar", 0.7), every: 300,
+           load() { this.layer.setParams({ t: Math.floor(Date.now() / 300000) }); } },
+  dwdwarn: { name: "Unwetterwarnungen (DWD)", layer: wms("dwd:Warnungen_Gemeinden_vereinigt", 0.55), every: 300,
+             load() { this.layer.setParams({ t: Math.floor(Date.now() / 300000) }); } },
+  nina: { name: "Warnungen (NINA)", layer: L.layerGroup(), every: 300, async load() {
+    const d = await api("layer/nina");
+    this.layer.clearLayers();
+    for (const w of d.warnings || []) {
+      const color = { Extreme: "#d03b3b", Severe: "#ec835a", Moderate: "#fab219" }[w.severity] || "#2a78d6";
+      for (const g of w.areas) L.geoJSON(g, { pane: "areas", style: { color, weight: 2, fillOpacity: 0.15 } })
+        .bindPopup(() => popup(w.title, `${w.provider.toUpperCase()} · ${w.severity} · seit ${fmtTime(w.start)}`, w.text, w.instruction))
+        .addTo(this.layer);
+    }
+    return `${(d.warnings || []).length}`;
+  } },
+  flights: { name: "Flugzeuge", layer: L.layerGroup(), every: 10, rows: [], at: 0, async load() {
+    const d = await api("layer/flights");
+    const seen = new Set();
+    this.rows = d.rows || []; this.at = Date.now() / 1000;
+    for (const [hex, lat, lon, alt, gs, track, call, type, reg] of this.rows) {
+      seen.add(hex);
+      let m = this.markers.get(hex);
+      if (!m) { m = L.marker([lat, lon], { keyboard: false, bubblingMouseEvents: false }).addTo(this.layer); this.markers.set(hex, m); }
+      m.setLatLng([lat, lon]);
+      m.setIcon(L.divIcon({ className: "", iconSize: null,
+        html: `<div class="plane${alt === 0 ? " ground" : ""}" style="transform:rotate(${track || 0}deg)"><svg viewBox="0 0 24 24"><path fill="currentColor" d="M12 2c.8 0 1.3.8 1.3 1.8v5.6l8.2 4.8v2l-8.2-2.4v4.6l2.4 1.8V22L12 21l-3.7 1v-1.8l2.4-1.8v-4.6L2.5 16.2v-2l8.2-4.8V3.8C10.7 2.8 11.2 2 12 2z"/></svg></div>` }));
+      m.bindTooltip(popup(call || reg || hex, [type, reg].filter(Boolean).join(" · "),
+        alt === 0 ? "am Boden" : `${Math.round(alt * 0.3048).toLocaleString("de-DE")} m · ${Math.round((gs || 0) * 1.852)} km/h`),
+        { className: "tip", direction: "top", offset: [0, -10] });
+    }
+    for (const [hex, m] of this.markers) if (!seen.has(hex)) { this.layer.removeLayer(m); this.markers.delete(hex); }
+    return `${this.rows.length}`;
+  }, markers: new Map(), tick() {
+    // Dead reckoning between polls: move each plane along its track at its ground speed
+    const dt = Date.now() / 1000 - this.at;
+    for (const [hex, lat, lon, alt, gs, track] of this.rows) {
+      if (!gs || alt === 0) continue;
+      const km = gs * 1.852 * dt / 3600, a = (track || 0) * Math.PI / 180;
+      this.markers.get(hex)?.setLatLng([lat + km * Math.cos(a) / 111.2, lon + km * Math.sin(a) / (111.2 * Math.cos(lat * Math.PI / 180))]);
+    }
+  } },
+  quakes: { name: "Erdbeben (30 Tage)", layer: L.layerGroup(), every: 600, async load() {
+    const d = await api("layer/quakes");
+    this.layer.clearLayers();
+    const now = Date.now() / 1000;
+    for (const [lat, lon, mag, depth, ts, region] of d.rows || [])
+      L.circleMarker([lat, lon], { radius: 3 + Math.max(0, mag) * 2.5, weight: 1.5, color: "#d03b3b",
+        fillColor: "#d03b3b", fillOpacity: now - ts < 86400 ? 0.6 : 0.15, bubblingMouseEvents: false })
+        .bindPopup(() => popup(`Magnitude ${mag?.toFixed(1)}`, region, `${fmtTime(ts)} · ${Math.round(depth)} km tief`, "Quelle: EMSC"))
+        .addTo(this.layer);
+    return `${(d.rows || []).length}`;
+  } },
+};
+// The four Autobahn layers share one request
+const AUTOBAHN = { roadworks: ["Autobahn: Baustellen", "#fab219"], closure: ["Autobahn: Sperrungen", "#d03b3b"],
+                   warning: ["Autobahn: Verkehrsmeldungen", "#8f4ad6"], charging: ["Autobahn: Ladesäulen", "#0ca30c"] };
+let autobahnData = null, autobahnAt = 0;
+for (const [kind, [name, color]] of Object.entries(AUTOBAHN)) overlays["ab_" + kind] = { name, layer: L.layerGroup(), every: 600, async load() {
+  if (Date.now() - autobahnAt > 60000) { autobahnAt = Date.now(); autobahnData = api("layer/autobahn"); }
+  const rows = ((await autobahnData).rows || []).filter(r => r[0] === kind);
+  this.layer.clearLayers();
+  for (const [, lat, lon, title, subtitle, desc, blocked] of rows)
+    // Rings, so they don't read as the filled bus and sensor dots
+    L.circleMarker([lat, lon], { radius: 4, weight: 3, color, fillColor: css("--surface-1"), fillOpacity: 1, bubblingMouseEvents: false })
+      .bindPopup(() => popup(title, subtitle + (blocked ? " · gesperrt" : ""), desc)).addTo(this.layer);
+  return `${rows.length}`;
+} };
+
+const ovControl = L.control.layers(null, {}, { position: "topright", collapsed: true }).addTo(map);
+const ovLabel = (k, count) => `${overlays[k].name}${count ? ` <span class="sub">${count}</span>` : ""}`;
+for (const k of Object.keys(overlays)) ovControl.addOverlay(overlays[k].layer, ovLabel(k));
+const ovOn = new Set((store.get("overlays") || "").split(",").filter(k => overlays[k]));
+
+async function ovLoad(k) {
+  const o = overlays[k];
+  try {
+    const count = await o.load();
+    // Update the count in place (Leaflet has no public API for renaming an entry)
+    const entry = ovControl._layers.find(l => l.layer === o.layer);
+    if (entry) { entry.name = ovLabel(k, count); ovControl._update(); }
+  } catch (e) { /* keep showing the last data */ }
+}
+function ovStart(k) {
+  const o = overlays[k];
+  ovOn.add(k); store.set("overlays", [...ovOn].join(","));
+  if (o.timer) return;
+  ovLoad(k); o.timer = setInterval(() => ovLoad(k), o.every * 1000);
+  if (o.tick) o.ticker = setInterval(() => o.tick(), 1000);
+}
+function ovStop(k) {
+  const o = overlays[k];
+  ovOn.delete(k); store.set("overlays", [...ovOn].join(","));
+  clearInterval(o.timer); clearInterval(o.ticker); o.timer = o.ticker = null;
+}
+const keyOf = layer => Object.keys(overlays).find(k => overlays[k].layer === layer);
+map.on("overlayadd", e => ovStart(keyOf(e.layer)));
+map.on("overlayremove", e => ovStop(keyOf(e.layer)));
+for (const k of ovOn) overlays[k].layer.addTo(map);  // fires overlayadd, which starts loading
+
+// Click on the map with the DWD warnings shown: ask DWD which warnings apply at that point
+map.on("click", async e => {
+  if (!map.hasLayer(overlays.dwdwarn.layer)) return;
+  const b = map.getBounds(), size = map.getSize(), pt = map.latLngToContainerPoint(e.latlng);
+  const q = { service: "WMS", version: "1.1.1", request: "GetFeatureInfo", layers: "dwd:Warnungen_Gemeinden_vereinigt",
+    query_layers: "dwd:Warnungen_Gemeinden_vereinigt", styles: "", srs: "EPSG:4326", info_format: "application/json",
+    bbox: [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(","), width: size.x, height: size.y,
+    x: Math.round(pt.x), y: Math.round(pt.y), feature_count: 10 };
+  try {
+    const d = await fetch(`${DWD_WMS}?${new URLSearchParams(q)}`).then(r => r.json());
+    const seen = new Set(), items = [];
+    for (const f of d.features || []) {
+      const p = f.properties || {}, key = p.HEADLINE || p.EVENT;
+      if (!key || seen.has(key)) continue;
+      seen.add(key); items.push(popup(p.HEADLINE || p.EVENT, p.ONSET && p.EXPIRES ? `${new Date(p.ONSET).toLocaleString("de-DE", { dateStyle: "short", timeStyle: "short" })} – ${new Date(p.EXPIRES).toLocaleString("de-DE", { dateStyle: "short", timeStyle: "short" })}` : "", p.DESCRIPTION));
+    }
+    L.popup().setLatLng(e.latlng).setContent(items.join("\n\n") || "Keine DWD-Warnung an diesem Ort.").openOn(map);
+  } catch { /* DWD not reachable: nothing to show */ }
+});
 
 loadQuantities().then(refresh);
 setInterval(() => loadQuantities().then(refresh), 60000);
