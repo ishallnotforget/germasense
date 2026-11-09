@@ -114,8 +114,10 @@ def series(con, sid, quantity, hours):
 
 
 def status(con):
+    # Each source's latest finished run: during a collection the newest run has only the sources done so far
     rows = con.execute("""SELECT source, started, stations, readings, error, seconds FROM runs
-                          WHERE started = (SELECT MAX(started) FROM runs)""").fetchall()
+                          WHERE (source, started) IN (SELECT source, MAX(started) FROM runs GROUP BY source)
+                          ORDER BY started DESC""").fetchall()
     pollen = {}
     for r in con.execute("""
             SELECT s.key, s.name, q.name AS quantity, l.value FROM stations s

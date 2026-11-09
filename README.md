@@ -111,6 +111,7 @@ Open `http://<server-ip>:8642` from any device on your network. There is no logi
   - **Flugzeuge:** aircraft over Germany, updated every 10 s and moved smoothly in between. Grey ones are on the ground.
   - **Erdbeben:** earthquakes of the last 30 days. Filled circles are from the last 24 hours.
   - **Autobahn:** current roadworks, closures, accidents and traffic warnings, and fast chargers, drawn as rings.
+  - **Mobilfunk:** mobile coverage per network (Telekom, Vodafone, O2, 1&1) or the best of all networks, coloured by the best technology (2G, 4G, 5G, 5G Standalone; for 1&1 also roaming). This is the operators' own outdoor coverage as reported to the Bundesnetzagentur, **not live**; the layer list and the legend show its date, e.g. "Stand 06.2026". It is updated about every quarter.
 
 ## Data sources
 
@@ -130,6 +131,7 @@ Open `http://<server-ip>:8642` from any device on your network. There is no logi
 | [NINA / BBK](https://warnung.bund.dev) | Civil-protection warnings | as issued |
 | [DWD GeoServer](https://maps.dwd.de) | Rain radar and weather warnings (map images) | all of Germany |
 | [EMSC](https://www.seismicportal.eu) | Earthquakes | ~100 per month |
+| [Bundesnetzagentur Mobilfunk-Monitoring](https://gigabitgrundbuch.bund.de/GIGA/DE/MobilfunkMonitoring/start.html) | Mobile coverage per network, 100 m grid (map tiles) | all of Germany, quarterly |
 
 Map tiles are © OpenStreetMap contributors.
 

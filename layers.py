@@ -13,11 +13,12 @@ import http.client
 import json
 import re
 import threading
+from collections import Counter
 import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote
 
-from collector import BBOX, UA, epoch, get_json, in_bbox
+from collector import BBOX, UA, epoch, get, get_json, in_bbox
 
 AUTOBAHN_SERVICES = {"roadworks": "roadworks", "closure": "closure", "warning": "warning",
                      "electric_charging_station": "charging"}
@@ -176,7 +177,18 @@ def quakes():
     return {"rows": rows}  # [lat, lon, magnitude, depth km, unix time, region]
 
 
-LAYERS = {"flights": (flights, 10), "autobahn": (autobahn, 600), "nina": (nina, 300), "quakes": (quakes, 600)}
+BNETZA_MAP_APP = "https://www.arcgis.com/sharing/rest/content/items/cea067d3b63243d2a107bf406a329f53/data?f=json"
+
+
+def coverage():
+    """Date of the Bundesnetzagentur mobile coverage maps. The browser loads the map tiles itself; the date is only
+    written in the official map app's text boxes ("Versorgungsdatenstand: 06.2026"), so take the most common one."""
+    dates = Counter(re.findall(r"Versorgungsdatenstand\W*(\d{2}\.\d{4})", get(BNETZA_MAP_APP, timeout=60).decode()))
+    return {"date": dates.most_common(1)[0][0] if dates else None}
+
+
+LAYERS = {"flights": (flights, 10), "autobahn": (autobahn, 600), "nina": (nina, 300), "quakes": (quakes, 600),
+          "coverage": (coverage, 86400)}
 
 
 class Layers:
